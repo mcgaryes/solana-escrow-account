@@ -1,0 +1,106 @@
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program_error::ProgramError,
+    msg,
+    pubkey::Pubkey,
+    program_pack::{Pack, IsInitialized},
+    sysvar::{rent::Rent, Sysvar},
+    program::invoke
+};
+
+use crate::{
+    instruction::EscrowInstruction,
+    error::EscrowError,
+    state::Escrow
+};
+
+pub struct Processor;
+impl Processor {
+
+    pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
+
+        let instruction = EscrowInstruction::unpack(instruction_data)?;
+
+        match instruction {
+            EscrowInstruction::InitEscrow { amount } => {
+                msg!("Instruction: InitEscrow");
+                Self::process_init_escrow(accounts, amount, program_id)
+            }
+        }
+
+    }
+
+    fn process_init_escrow(
+        accounts: &[AccountInfo],
+        amount: u64,
+        program_id: &Pubkey,
+    ) -> ProgramResult {
+
+        let account_info_iter = &mut accounts.iter();
+        let initializer = next_account_info(account_info_iter)?;
+
+        if !initializer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let temp_token_account = next_account_info(account_info_iter)?;
+
+        let token_to_receive_account = next_account_info(account_info_iter)?;
+        if *token_to_receive_account.owner != spl_token::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let escrow_account = next_account_info(account_info_iter)?;
+        let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
+
+        if !rent.is_exempt(escrow_account.lamports(), escrow_account.data_len()) {
+            return Err(EscrowError::NotRentExempt.into());
+        }
+
+        // deserialize the escrow account info and make the struct mutatable
+        let mut escrow_info = Escrow::unpack_unchecked(&escrow_account.try_borrow_data()?)?;
+        if escrow_info.is_initialized() {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+
+        // update the escrow struct
+        escrow_info.is_initialized = true;
+        escrow_info.initializer_pubkey = *initializer.key;
+        escrow_info.temp_token_account_pubkey = *temp_token_account.key;
+        escrow_info.initializer_token_to_receive_account_pubkey = *token_to_receive_account.key;
+        escrow_info.expected_amount = amount;
+
+        // serialize the escrow struct
+        Escrow::pack(escrow_info, &mut escrow_account.try_borrow_mut_data()?)?;
+
+        // note the underscore before the _bump_seed name, this means that it will not be used
+        let (pda, _bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+
+        let token_program = next_account_info(account_info_iter)?;
+
+        let owner_change_ix = spl_token::instruction::set_authority(
+            token_program.key, // token program id
+            temp_token_account.key, // the account whos authority we want to change
+            Some(&pda), // the account who we're giving the authority to
+            spl_token::instruction::AuthorityType::AccountOwner,
+            initializer.key, // the account of who initialize the transaction (e.g. Alice)
+            &[&initializer.key], // the public keys signing the CPI.
+        )?;
+
+        msg!("Calling the token program to transfer token account ownership...");
+
+        invoke(
+            &owner_change_ix,
+            &[
+                temp_token_account.clone(),
+                initializer.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
+        Ok(())
+
+    }
+
+}
